@@ -23,6 +23,27 @@ from app.storage.repository_store import update_job, update_repository_status
 logger = logging.getLogger(__name__)
 
 
+def _safe_unlink(path: Optional[Path]) -> None:
+    """Safely unlink a file, handling Windows file-lock and permission errors gracefully."""
+    if not path:
+        return
+    try:
+        if path.exists():
+            try:
+                import stat
+                path.chmod(stat.S_IWRITE)
+            except Exception:
+                pass
+            path.unlink(missing_ok=True)
+    except (PermissionError, OSError) as exc:
+        logger.warning("Could not unlink %s (file locked or syncing): %s", path, exc)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.truncate(0)
+        except Exception:
+            pass
+
+
 class IndexingService:
     """Manages background indexing job execution using a bounded thread pool."""
 
@@ -118,8 +139,7 @@ class IndexingService:
                 artifact_dir / "cluster_summaries.json",
                 artifact_dir / "workflows.json",
             ]:
-                if stale_file.exists():
-                    stale_file.unlink(missing_ok=True)
+                _safe_unlink(stale_file)
 
             extract_archive_safely(
                 zip_path=temp_zip_file,
@@ -128,7 +148,7 @@ class IndexingService:
 
             # Delete temporary archive download promptly
             if temp_zip_file and temp_zip_file.exists():
-                temp_zip_file.unlink(missing_ok=True)
+                _safe_unlink(temp_zip_file)
                 temp_zip_file = None
 
             # ----------------------------------------------------

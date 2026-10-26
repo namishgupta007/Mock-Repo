@@ -8,9 +8,18 @@ import {
   signInWithEmailAndPassword,
   sendPasswordResetEmail,
   sendEmailVerification,
+  updateProfile,
   signOut,
 } from 'firebase/auth';
 import { auth, googleProvider, isFirebaseConfigured } from '../firebase.js';
+import {
+  registerDemoUser,
+  loginDemoUser,
+  guestDemoLogin,
+  getActiveDemoSession,
+  clearDemoSession,
+  initializeDemoDatabase,
+} from '../services/demoAuthService.js';
 
 const MESSAGES = {
   'auth/invalid-email': 'That email address looks invalid.',
@@ -34,49 +43,141 @@ export function friendlyError(err) {
   return MESSAGES[err?.code] || err?.message || 'Something went wrong. Please try again.';
 }
 
+export const isDemoMode = !isFirebaseConfigured;
+export const authMode = isFirebaseConfigured ? 'firebase' : 'demo';
+
 const AuthContext = createContext(null);
 
 function useAuthState() {
-  const [user, setUser] = useState(null);
-  const [ready, setReady] = useState(!isFirebaseConfigured);
+  const [user, setUser] = useState(() => (isDemoMode ? getActiveDemoSession() : null));
+  const [ready, setReady] = useState(isDemoMode);
 
   useEffect(() => {
-    if (!auth) return undefined;
-    getRedirectResult(auth).catch(() => {});
-    return onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setReady(true);
-    });
+    if (isFirebaseConfigured && auth) {
+      getRedirectResult(auth).catch(() => { });
+      return onAuthStateChanged(auth, (u) => {
+        if (u) {
+          setUser(u);
+        } else {
+          const demoSession = getActiveDemoSession();
+          setUser(demoSession);
+        }
+        setReady(true);
+      });
+    }
+
+    // In Local Demo Mode, ensure seed user exists and load stored session
+    initializeDemoDatabase()
+      .catch((err) => console.warn('Demo DB init note:', err))
+      .finally(() => {
+        const stored = getActiveDemoSession();
+        setUser(stored);
+        setReady(true);
+      });
+    return undefined;
   }, []);
 
   const google = useCallback(async () => {
-    try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err) {
-      if (err?.code === 'auth/popup-blocked') {
-        await signInWithRedirect(auth, googleProvider);
-        return;
+    if (isFirebaseConfigured && auth) {
+      try {
+        return await signInWithPopup(auth, googleProvider);
+      } catch (err) {
+        if (err?.code === 'auth/popup-blocked') {
+          await signInWithRedirect(auth, googleProvider);
+          return;
+        }
+        throw err;
       }
-      throw err;
+    } else {
+      // Demo mode fallback
+      const guest = guestDemoLogin();
+      setUser(guest);
+      return guest;
     }
   }, []);
 
-  const signUp = useCallback(async (email, password) => {
-    const cred = await createUserWithEmailAndPassword(auth, email, password);
-    sendEmailVerification(cred.user).catch(() => {});
-  }, []);
-
-  const signIn = useCallback(
-    (email, password) => signInWithEmailAndPassword(auth, email, password),
+  const signUp = useCallback(
+    async (email, password, name = '') => {
+      if (isFirebaseConfigured && auth) {
+        const cred = await createUserWithEmailAndPassword(auth, email, password);
+        if (name && cred.user) {
+          updateProfile(cred.user, { displayName: name }).catch(() => { });
+        }
+        sendEmailVerification(cred.user).catch(() => { });
+        return cred;
+      } else {
+        const demoUser = await registerDemoUser({ name, email, password });
+        setUser(demoUser);
+        return demoUser;
+      }
+    },
     []
   );
 
-  const reset = useCallback((email) => sendPasswordResetEmail(auth, email), []);
-  const logout = useCallback(() => signOut(auth), []);
-  // Fresh Firebase ID token, sent to the backend so it can tell who the user is.
-  const getToken = useCallback(() => (auth?.currentUser ? auth.currentUser.getIdToken() : null), []);
+  const signIn = useCallback(
+    async (email, password) => {
+      if (isFirebaseConfigured && auth) {
+        return signInWithEmailAndPassword(auth, email, password);
+      } else {
+        const demoUser = await loginDemoUser({ email, password });
+        setUser(demoUser);
+        return demoUser;
+      }
+    },
+    []
+  );
 
-  return { user, ready, google, signUp, signIn, reset, logout, getToken };
+  const guestSignIn = useCallback(() => {
+    if (isFirebaseConfigured && auth) {
+      return signInWithPopup(auth, googleProvider);
+    } else {
+      const guest = guestDemoLogin();
+      setUser(guest);
+      return guest;
+    }
+  }, []);
+
+  const reset = useCallback(async (email) => {
+    if (isFirebaseConfigured && auth) {
+      return sendPasswordResetEmail(auth, email);
+    }
+    return Promise.resolve();
+  }, []);
+
+  const logout = useCallback(async () => {
+    if (isFirebaseConfigured && auth) {
+      await signOut(auth).catch(() => { });
+    } else {
+      clearDemoSession();
+    }
+    setUser(null);
+  }, []);
+
+  // Fresh Firebase ID token or local token
+  const getToken = useCallback(async () => {
+    if (auth?.currentUser) {
+      return auth.currentUser.getIdToken();
+    }
+    if (user?.getIdToken) {
+      return user.getIdToken();
+    }
+    return 'demo_token_local';
+  }, [user]);
+
+  return {
+    user,
+    ready,
+    authMode,
+    isDemoMode,
+    isFirebaseConfigured,
+    google,
+    signUp,
+    signIn,
+    guestSignIn,
+    reset,
+    logout,
+    getToken,
+  };
 }
 
 // One shared auth state for the whole app (wrap <App /> content with this).

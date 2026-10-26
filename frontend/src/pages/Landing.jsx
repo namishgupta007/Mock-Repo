@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   Lock,
   Mail,
+  User,
   Eye,
   EyeOff,
   Folder,
@@ -13,11 +14,17 @@ import {
   Zap,
   ArrowRight,
   Shield,
+  ShieldCheck,
+  CheckCircle2,
+  AlertCircle,
+  Info,
+  Loader2,
   Layers,
 } from "lucide-react";
 import useAuth, { friendlyError } from "../hooks/useAuth.js";
 import HeroGraph from "../components/Graph/HeroGraph.jsx";
 import SiteFooter from "../components/SiteFooter.jsx";
+import { SEED_DEMO_ACCOUNT } from "../services/demoAuthService.js";
 
 // Official Astrograph Team Ringed Planet Logo (Exact pixel match to the official artwork)
 export function RingedPlanetLogo({ className = "h-7 w-auto" }) {
@@ -68,32 +75,75 @@ function GoogleIcon() {
 
 export default function Landing() {
   const navigate = useNavigate();
-  const { user, signIn, signUp, google } = useAuth();
+  const {
+    user,
+    ready,
+    authMode: activeAuthMode,
+    isDemoMode,
+    isFirebaseConfigured,
+    signIn,
+    signUp,
+    guestSignIn,
+    google,
+  } = useAuth();
 
   const [authMode, setAuthMode] = useState("login"); // 'login' | 'signup'
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [rememberMe, setRememberMe] = useState(true);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [authError, setAuthError] = useState("");
+  const [authSuccess, setAuthSuccess] = useState("");
+
+  // Automatically forward authenticated users to the dashboard (prevents redirect loops)
+  useEffect(() => {
+    if (user && ready) {
+      navigate("/dashboard", { replace: true });
+    }
+  }, [user, ready, navigate]);
 
   const handleAuthSubmit = async (e) => {
     e?.preventDefault();
     setAuthError("");
+    setAuthSuccess("");
     setIsSubmitting(true);
 
     try {
       if (authMode === "signup") {
+        const trimmedName = name.trim();
+        if (!trimmedName || trimmedName.length < 2) {
+          throw new Error("Please enter your full name (at least 2 characters).");
+        }
+        if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+          throw new Error("Please enter a valid email address (e.g., developer@domain.com).");
+        }
         if (!password || password.length < 6) {
           throw new Error("Password must be at least 6 characters.");
         }
-        if (signUp) await signUp(email.trim(), password);
+        if (password !== confirmPassword) {
+          throw new Error("Passwords do not match. Please verify both passwords.");
+        }
+
+        if (signUp) {
+          await signUp(email.trim(), password, trimmedName);
+        }
+        setAuthSuccess("Account registered successfully! Redirecting...");
       } else {
+        if (!email.trim()) {
+          throw new Error("Please enter your email address.");
+        }
         if (!password) {
           throw new Error("Please enter your password.");
         }
-        if (signIn) await signIn(email.trim(), password);
+
+        if (signIn) {
+          await signIn(email.trim(), password);
+        }
+        setAuthSuccess("Signed in successfully! Redirecting...");
       }
       navigate("/dashboard");
     } catch (err) {
@@ -106,12 +156,37 @@ export default function Landing() {
   };
 
   const handleOAuth = async () => {
+    setAuthError("");
+    setAuthSuccess("");
+    setIsSubmitting(true);
     try {
       if (google) await google();
       navigate("/dashboard");
-    } catch {
-      navigate("/dashboard");
+    } catch (err) {
+      console.warn("OAuth error:", err);
+      const msg = friendlyError ? friendlyError(err) : (err.message || "OAuth sign-in failed.");
+      setAuthError(msg);
+    } finally {
+      setIsSubmitting(false);
     }
+  };
+
+  const handleGuestAccess = () => {
+    setAuthError("");
+    setAuthSuccess("");
+    try {
+      if (guestSignIn) guestSignIn();
+      navigate("/dashboard");
+    } catch (err) {
+      setAuthError(err.message || "Unable to start guest session.");
+    }
+  };
+
+  const fillDemoCredentials = () => {
+    setEmail(SEED_DEMO_ACCOUNT.email);
+    setPassword(SEED_DEMO_ACCOUNT.password);
+    setAuthMode("login");
+    setAuthError("");
   };
 
   return (
@@ -389,54 +464,132 @@ export default function Landing() {
 
         {/* Right Column (5 cols): Glassmorphic Auth Card */}
         <div>
-          <section className="auth-glass-card">
+          <section className="auth-glass-card" aria-labelledby="auth-header-title">
             <div className="auth-card-top">
               <div className="auth-planet-logo">
                 <RingedPlanetLogoCard className="h-10 w-auto" />
               </div>
-              <h2 className="auth-card-title">
-                Welcome to <em>Astrograph</em>
+              <h2 id="auth-header-title" className="auth-card-title">
+                {authMode === "login" ? (
+                  <>Welcome to <em>Astrograph</em></>
+                ) : (
+                  <>Create Your <em>Account</em></>
+                )}
               </h2>
               <p className="auth-card-subtitle">
-                Sign in to your account to explore your repositories and unlock
-                the power of AI-driven code analysis.
+                {authMode === "login"
+                  ? "Sign in to explore your repositories and unlock the power of AI-driven code analysis."
+                  : "Join Astrograph to construct 2D/3D code graphs, extract AST dependencies, and trace architectures."}
               </p>
+
+              {/* Mode indicator badge */}
+              <div className="auth-mode-indicator">
+                {isDemoMode ? (
+                  <div
+                    className="auth-badge auth-badge--demo"
+                    title="Firebase keys are not configured in frontend/.env. Running in Local Demo Mode."
+                  >
+                    <span className="auth-badge-dot auth-badge-dot--demo animate-pulse" />
+                    <span>LOCAL DEMO MODE (EVALUATION READY)</span>
+                  </div>
+                ) : (
+                  <div
+                    className="auth-badge auth-badge--firebase"
+                    title="Firebase Cloud Authentication connected."
+                  >
+                    <span className="auth-badge-dot auth-badge-dot--firebase" />
+                    <span>FIREBASE AUTH (PRODUCTION CLOUD)</span>
+                  </div>
+                )}
+              </div>
             </div>
 
-            {/* Mode Switch: Log In | Sign Up */}
-            <div className="auth-tabs-row">
+            {/* Quick Evaluator Pre-seeded Account Card (Only in Demo Mode) */}
+            {isDemoMode && authMode === "login" && (
+              <div className="auth-demo-helper-card">
+                <div className="auth-demo-helper-header">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.35rem' }}>
+                    <Sparkles size={13} style={{ color: '#FB923C' }} />
+                    <span>EVALUATOR TEST ACCOUNT</span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={fillDemoCredentials}
+                    className="auth-demo-fill-btn"
+                  >
+                    Auto-Fill
+                  </button>
+                </div>
+                <div style={{ fontSize: '0.72rem', color: '#D1D5DB', fontFamily: 'var(--font-mono, monospace)' }}>
+                  <div><span style={{ color: '#9CA3AF' }}>Email: </span><span style={{ color: '#FED7AA' }}>{SEED_DEMO_ACCOUNT.email}</span></div>
+                  <div><span style={{ color: '#9CA3AF' }}>Password: </span><span style={{ color: '#FED7AA' }}>{SEED_DEMO_ACCOUNT.password}</span></div>
+                </div>
+              </div>
+            )}
+
+            {/* Mode Switch Tabs: Log In | Sign Up */}
+            <div className="auth-tabs-row" role="tablist">
               <button
                 type="button"
+                role="tab"
+                aria-selected={authMode === "login"}
                 className={`auth-tab-btn ${authMode === "login" ? "auth-tab-btn--active" : ""}`}
-                onClick={() => setAuthMode("login")}
+                onClick={() => {
+                  setAuthMode("login");
+                  setAuthError("");
+                  setAuthSuccess("");
+                }}
               >
                 Log In
               </button>
               <button
                 type="button"
+                role="tab"
+                aria-selected={authMode === "signup"}
                 className={`auth-tab-btn ${authMode === "signup" ? "auth-tab-btn--active" : ""}`}
-                onClick={() => setAuthMode("signup")}
+                onClick={() => {
+                  setAuthMode("signup");
+                  setAuthError("");
+                  setAuthSuccess("");
+                }}
               >
                 Sign Up
               </button>
             </div>
 
-            {/* Inputs Form */}
-            <form onSubmit={handleAuthSubmit} className="auth-form-fields">
+            {/* Form Fields */}
+            <form onSubmit={handleAuthSubmit} className="auth-form-fields" noValidate>
               {authError && (
-                <div style={{
-                  padding: '0.65rem 0.85rem',
-                  borderRadius: '8px',
-                  backgroundColor: 'rgba(239, 68, 68, 0.15)',
-                  border: '1px solid rgba(239, 68, 68, 0.4)',
-                  color: '#fca5a5',
-                  fontSize: '0.78rem',
-                  fontFamily: 'var(--font-mono, monospace)',
-                  lineHeight: '1.4'
-                }} role="alert">
-                  {authError}
+                <div className="auth-error-badge" role="alert">
+                  <AlertCircle size={16} className="shrink-0" />
+                  <span>{authError}</span>
                 </div>
               )}
+
+              {authSuccess && (
+                <div className="auth-success-badge" role="status">
+                  <CheckCircle2 size={16} className="shrink-0" />
+                  <span>{authSuccess}</span>
+                </div>
+              )}
+
+              {/* Name Field (Sign Up Only) */}
+              {authMode === "signup" && (
+                <div className="auth-input-wrap">
+                  <User size={16} className="auth-input-icon" />
+                  <input
+                    type="text"
+                    required
+                    placeholder="Full Name (e.g. Alex Morgan)"
+                    className="auth-text-input"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    disabled={isSubmitting}
+                  />
+                </div>
+              )}
+
+              {/* Email Field */}
               <div className="auth-input-wrap">
                 <Mail size={16} className="auth-input-icon" />
                 <input
@@ -446,70 +599,183 @@ export default function Landing() {
                   className="auth-text-input"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
+                  disabled={isSubmitting}
+                  autoComplete="email"
                 />
               </div>
 
+              {/* Password Field */}
               <div className="auth-input-wrap">
                 <Lock size={16} className="auth-input-icon" />
                 <input
                   type={showPassword ? "text" : "password"}
                   required
-                  placeholder="Password"
+                  placeholder={authMode === "signup" ? "Password (min. 6 chars)" : "Password"}
                   className="auth-text-input"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
+                  disabled={isSubmitting}
+                  autoComplete={authMode === "signup" ? "new-password" : "current-password"}
                 />
                 <button
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
                   className="auth-eye-btn"
+                  aria-label={showPassword ? "Hide password" : "Show password"}
                 >
                   {showPassword ? <EyeOff size={16} /> : <Eye size={16} />}
                 </button>
               </div>
 
-              <div className="auth-row-remember">
-                <label className="auth-remember-label">
+              {/* Confirm Password Field (Sign Up Only) */}
+              {authMode === "signup" && (
+                <div className="auth-input-wrap">
+                  <ShieldCheck size={16} className="auth-input-icon" />
                   <input
-                    type="checkbox"
-                    checked={rememberMe}
-                    onChange={(e) => setRememberMe(e.target.checked)}
-                    className="accent-[#FB923C] rounded"
+                    type={showConfirmPassword ? "text" : "password"}
+                    required
+                    placeholder="Confirm Password"
+                    className="auth-text-input"
+                    value={confirmPassword}
+                    onChange={(e) => setConfirmPassword(e.target.value)}
+                    disabled={isSubmitting}
+                    autoComplete="new-password"
                   />
-                  <span>Remember me</span>
-                </label>
-                <a href="#forgot" className="auth-forgot-link">
-                  Forgot password?
-                </a>
-              </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowConfirmPassword(!showConfirmPassword)}
+                    className="auth-eye-btn"
+                    aria-label={showConfirmPassword ? "Hide confirm password" : "Show confirm password"}
+                  >
+                    {showConfirmPassword ? <EyeOff size={16} /> : <Eye size={16} />}
+                  </button>
+                </div>
+              )}
 
+              {/* Remember Me & Forgot Password (Login Only) */}
+              {authMode === "login" && (
+                <div className="auth-row-remember">
+                  <label className="auth-remember-label">
+                    <input
+                      type="checkbox"
+                      checked={rememberMe}
+                      onChange={(e) => setRememberMe(e.target.checked)}
+                      className="accent-[#FB923C] rounded"
+                    />
+                    <span>Remember me</span>
+                  </label>
+                  <a
+                    href="#demo-credentials"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      fillDemoCredentials();
+                    }}
+                    className="auth-forgot-link"
+                    title="Click to auto-fill evaluator demo credentials"
+                  >
+                    Use demo credentials
+                  </a>
+                </div>
+              )}
+
+              {/* Submit Button */}
               <button
                 type="submit"
                 disabled={isSubmitting}
                 className="auth-primary-btn"
               >
-                <span>
-                  {authMode === "login" ? "Log In" : "Create Account"}
-                </span>
-                <ArrowRight size={16} />
+                {isSubmitting ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    <span>Processing...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>
+                      {authMode === "login"
+                        ? "Log In"
+                        : isDemoMode
+                          ? "Register Demo Account"
+                          : "Create Account"}
+                    </span>
+                    <ArrowRight size={16} />
+                  </>
+                )}
               </button>
 
               <div className="auth-divider-line">
                 <span>or</span>
               </div>
 
+              {/* Instant Guest / Explorer Login */}
+              <button
+                type="button"
+                onClick={handleGuestAccess}
+                className="auth-github-btn"
+                style={{
+                  borderColor: 'rgba(251, 146, 60, 0.35)',
+                  backgroundColor: 'rgba(251, 146, 60, 0.08)',
+                  color: '#FFF7ED',
+                }}
+                disabled={isSubmitting}
+              >
+                <Sparkles size={16} style={{ color: '#FB923C' }} />
+                <span>Continue as Guest (Instant Access)</span>
+              </button>
+
+              {/* Google OAuth Option */}
               <button
                 type="button"
                 onClick={handleOAuth}
                 className="auth-github-btn"
+                disabled={isSubmitting}
               >
                 <GoogleIcon />
                 <span>Continue with Google</span>
               </button>
 
+              {/* Switch Mode Footer Link */}
+              <div className="auth-form-footer-switch">
+                {authMode === "login" ? (
+                  <span>
+                    Don't have an account?{" "}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthMode("signup");
+                        setAuthError("");
+                        setAuthSuccess("");
+                      }}
+                      className="auth-switch-link-btn"
+                    >
+                      Sign Up
+                    </button>
+                  </span>
+                ) : (
+                  <span>
+                    Already have an account?{" "}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setAuthMode("login");
+                        setAuthError("");
+                        setAuthSuccess("");
+                      }}
+                      className="auth-switch-link-btn"
+                    >
+                      Log In
+                    </button>
+                  </span>
+                )}
+              </div>
+
               <div className="auth-security-footer">
                 <Shield size={13} />
-                <span>Secure and encrypted</span>
+                <span>
+                  {isDemoMode
+                    ? "Local Session Active • SHA-256 Hashed Passwords"
+                    : "Secure & Encrypted Firebase Authentication"}
+                </span>
               </div>
             </form>
           </section>

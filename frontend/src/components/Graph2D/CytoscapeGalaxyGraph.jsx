@@ -9,22 +9,15 @@ import {
   Target,
   Folder,
   Layers,
-  Share2
+  Share2,
+  ArrowRight,
 } from 'lucide-react';
 import GalaxyBackground2D from './GalaxyBackground2D.jsx';
-
-// Inline Python logo SVG data URI
-const PYTHON_SVG = `data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><path fill="%23387eb8" d="M63.5 1.5c-30.8 0-28.8 13.3-28.8 13.3l.03 13.8h29.3v4.2H24.3C10.7 32.8 1.5 41.5 1.5 59.8c0 18.4 8 26.2 19.3 26.2h11.5v-16.1c0-12.2 10.5-22.9 22.9-22.9h29.2v-16.2c0-12.8-11.2-29.3-20.9-29.3zm-16.4 8.7c2.6 0 4.7 2.1 4.7 4.7s-2.1 4.7-4.7 4.7-4.7-2.1-4.7-4.7 2.1-4.7 4.7-4.7z"/><path fill="%23ffe052" d="M64.5 126.5c30.8 0 28.8-13.3 28.8-13.3l-.03-13.8H64v-4.2h39.7c13.6 0 22.8-8.7 22.8-27s-8-26.2-19.3-26.2H115.7v16.1c0 12.2-10.5 22.9-22.9 22.9H63.6v16.2c0 12.8 11.2 29.3 20.9 29.3zm16.4-8.7c-2.6 0-4.7-2.1-4.7-4.7s2.1-4.7 4.7-4.7 4.7 2.1 4.7 4.7-2.1 4.7-4.7 4.7z"/></svg>`;
-
-// Preset cluster layout center points matching the reference image layout
-const PRESET_CLUSTER_POSITIONS = {
-  src: { x: -310, y: -160 },
-  services: { x: 260, y: -170 },
-  SolarFluxEngine: { x: -40, y: 190 },
-  models: { x: -420, y: 190 },
-  api: { x: 380, y: 40 },
-  utils: { x: 330, y: 260 },
-};
+import {
+  calculateNodeDimensions,
+  computeForceDirectedLayout,
+  computeHierarchicalLayout,
+} from './graphLayouts.js';
 
 export default function CytoscapeGalaxyGraph({
   graphData,
@@ -36,6 +29,90 @@ export default function CytoscapeGalaxyGraph({
   const containerRef = useRef(null);
   const cyRef = useRef(null);
   const [clusterBoxes, setClusterBoxes] = useState([]);
+  const [hoveredEdge, setHoveredEdge] = useState(null);
+  const animFrameRef = useRef(null);
+  const selectedNodeIdRef = useRef(selectedNodeId);
+  const hoverTargetRef = useRef(null);
+
+  useEffect(() => {
+    selectedNodeIdRef.current = selectedNodeId;
+  }, [selectedNodeId]);
+
+  // Centralized visual state manager for selection, hover previews, and clean restoration
+  const applyVisualState = useCallback((targetHover = hoverTargetRef.current, targetSelected = selectedNodeIdRef.current) => {
+    const cy = cyRef.current;
+    if (!cy) return;
+
+    // Reset previous classes
+    cy.elements().removeClass('selected hovered edge-hovered connected-neighbor edge-incoming edge-outgoing dimmed');
+
+    // Case A: Hovering an edge (preview relationship endpoints & direction)
+    if (targetHover?.type === 'edge') {
+      const edge = cy.getElementById(targetHover.id);
+      if (edge && edge.length > 0) {
+        cy.elements().addClass('dimmed');
+        edge.removeClass('dimmed').addClass('edge-hovered');
+
+        const sNode = edge.source();
+        const tNode = edge.target();
+        if (sNode.length > 0) sNode.removeClass('dimmed').addClass('connected-neighbor');
+        if (tNode.length > 0) tNode.removeClass('dimmed').addClass('connected-neighbor');
+
+        // If a node was persistently selected, keep it marked with .selected
+        if (targetSelected) {
+          const selNode = cy.getElementById(targetSelected);
+          if (selNode.length > 0) selNode.removeClass('dimmed').addClass('selected');
+        }
+        return;
+      }
+    }
+
+    // Case B: Hovering a node (temporary preview of connections without destroying persistent selection)
+    if (targetHover?.type === 'node') {
+      const hNode = cy.getElementById(targetHover.id);
+      if (hNode && hNode.length > 0) {
+        cy.elements().addClass('dimmed');
+        hNode.removeClass('dimmed').addClass('hovered');
+
+        const inEdges = hNode.incomers('edge');
+        inEdges.removeClass('dimmed').addClass('edge-incoming');
+
+        const outEdges = hNode.outgoers('edge');
+        outEdges.removeClass('dimmed').addClass('edge-outgoing');
+
+        const neighbors = hNode.neighborhood('node');
+        neighbors.removeClass('dimmed').addClass('connected-neighbor');
+
+        // If a persistent node is selected (and not the hovered node), keep it visible as selected
+        if (targetSelected && targetSelected !== targetHover.id) {
+          const selNode = cy.getElementById(targetSelected);
+          if (selNode.length > 0) selNode.removeClass('dimmed').addClass('selected');
+        }
+        return;
+      }
+    }
+
+    // Case C: Persistent selection
+    if (targetSelected) {
+      const selNode = cy.getElementById(targetSelected);
+      if (selNode && selNode.length > 0) {
+        cy.elements().addClass('dimmed');
+        selNode.removeClass('dimmed').addClass('selected');
+
+        const inEdges = selNode.incomers('edge');
+        inEdges.removeClass('dimmed').addClass('edge-incoming');
+
+        const outEdges = selNode.outgoers('edge');
+        outEdges.removeClass('dimmed').addClass('edge-outgoing');
+
+        const neighbors = selNode.neighborhood('node');
+        neighbors.removeClass('dimmed').addClass('connected-neighbor');
+        return;
+      }
+    }
+
+    // Case D: Neither selected nor hovered => all elements restored to normal
+  }, []);
 
   // Toolbar & Filter states
   const [searchQuery, setSearchQuery] = useState('');
@@ -51,7 +128,7 @@ export default function CytoscapeGalaxyGraph({
     return ['all', ...Array.from(langs)];
   }, [graphData]);
 
-  // Compute Cytoscape elements (File child nodes + File-to-File edges only)
+  // Compute Cytoscape elements (File & Symbol child nodes + Directed edges)
   // Containers are rendered via pure dynamic CSS overlay to match the reference design 100%
   const elements = useMemo(() => {
     if (!graphData || !Array.isArray(graphData.nodes)) return [];
@@ -86,8 +163,9 @@ export default function CytoscapeGalaxyGraph({
 
     validNodes.forEach((n) => activeNodeIds.add(n.id));
 
-    // 2. Add File Nodes
+    // 2. Add Code Nodes with dynamically calculated dimensions
     validNodes.forEach((node) => {
+      const dim = calculateNodeDimensions(node);
       elems.push({
         group: 'nodes',
         data: {
@@ -101,14 +179,23 @@ export default function CytoscapeGalaxyGraph({
           centrality: node.metrics?.centrality || 0,
           complexity: node.metrics?.complexity || 0,
           ai_summary: node.ai_summary,
+          width: dim.width,
+          height: dim.height,
+          cornerRadius: dim.cornerRadius,
+          fontSize: dim.fontSize,
+          textMaxWidth: dim.textMaxWidth,
+          borderColor: dim.borderColor,
+          bgColor: dim.bgColor,
+          typeColor: dim.typeColor,
+          typeBadge: dim.badge,
+          icon: dim.icon,
         },
       });
     });
 
-    // 3. Add Direct File-to-File Edges
+    // 3. Add Direct Directed Edges
     if (Array.isArray(graphData.edges)) {
       graphData.edges.forEach((edge) => {
-        // File-to-file arrows only
         if (!activeNodeIds.has(edge.source) || !activeNodeIds.has(edge.target)) return;
 
         // Dependency relation filter
@@ -123,7 +210,7 @@ export default function CytoscapeGalaxyGraph({
             id: edge.id,
             source: edge.source,
             target: edge.target,
-            relation: edge.relation,
+            relation: edge.relation || 'imports',
             weight: edge.weight,
             is_cross_cluster: edge.is_cross_cluster,
           },
@@ -147,9 +234,9 @@ export default function CytoscapeGalaxyGraph({
       const rbb = nodesInCluster.renderedBoundingBox();
       if (!rbb || rbb.w <= 0 || rbb.h <= 0) return;
 
-      const padX = 28;
+      const padX = 26;
       const padTop = 50;
-      const padBottom = 26;
+      const padBottom = 22;
 
       boxes.push({
         id: cluster.id,
@@ -169,210 +256,38 @@ export default function CytoscapeGalaxyGraph({
     setClusterBoxes(boxes);
   }, [graphData]);
 
-  // Apply Cytoscape Layout
-  const applyLayout = useCallback((layoutType = activeLayout) => {
-    const cy = cyRef.current;
-    if (!cy) return;
-
-    if (layoutType === 'force') {
-      // Position nodes inside their clusters cleanly
-      const clusters = graphData?.clusters || [];
-      clusters.forEach((cluster, cIdx) => {
-        const basePos = PRESET_CLUSTER_POSITIONS[cluster.path] || {
-          x: (cIdx % 3) * 360 - 360,
-          y: Math.floor(cIdx / 3) * 320 - 160,
-        };
-
-        const childNodes = cy.nodes(`[cluster = "${cluster.path}"]`);
-        const count = childNodes.length;
-
-        // Clean relative positioning based on cluster size matching reference image
-        childNodes.forEach((child, idx) => {
-          let offsetX = 0;
-          let offsetY = 0;
-
-          if (cluster.path === 'src') {
-            // 5 files: main.py top, routes.py left, telemetry.py right, models.py bottom-left, weather.py bottom-right
-            const srcOffsets = [
-              { x: -30, y: -65 },  // main.py
-              { x: -95, y: -10 },  // routes.py
-              { x: 55, y: -10 },   // telemetry.py
-              { x: -75, y: 55 },   // models.py
-              { x: 45, y: 55 },    // weather.py
-            ];
-            offsetX = srcOffsets[idx]?.x ?? (idx * 30);
-            offsetY = srcOffsets[idx]?.y ?? (idx * 20);
-          } else if (cluster.path === 'services') {
-            // 3 files: data_fetcher.py top-right, processing.py left, api_client.py bottom-right
-            const servOffsets = [
-              { x: 60, y: -50 },   // data_fetcher.py
-              { x: -70, y: 0 },    // processing.py
-              { x: 70, y: 30 },    // api_client.py
-            ];
-            offsetX = servOffsets[idx]?.x ?? (idx * 40);
-            offsetY = servOffsets[idx]?.y ?? (idx * 20);
-          } else if (cluster.path === 'SolarFluxEngine') {
-            // 4 files: engine.py top, magnetosphere.py left, solar.py right, prediction.py bottom
-            const solarOffsets = [
-              { x: -5, y: -60 },   // engine.py
-              { x: -85, y: 0 },    // magnetosphere.py
-              { x: 75, y: 0 },     // solar.py
-              { x: -5, y: 55 },    // prediction.py
-            ];
-            offsetX = solarOffsets[idx]?.x ?? (idx * 30);
-            offsetY = solarOffsets[idx]?.y ?? (idx * 20);
-          } else if (cluster.path === 'models') {
-            // 3 files: base.py top, forecast.py bottom-left, solar.py bottom-right
-            const modOffsets = [
-              { x: 0, y: -45 },    // base.py
-              { x: -65, y: 15 },   // forecast.py
-              { x: 50, y: 35 },    // solar.py
-            ];
-            offsetX = modOffsets[idx]?.x ?? (idx * 30);
-            offsetY = modOffsets[idx]?.y ?? (idx * 20);
-          } else if (cluster.path === 'api') {
-            // 2 files: endpoints.py top, schemas.py bottom
-            const apiOffsets = [
-              { x: 0, y: -30 },    // endpoints.py
-              { x: 5, y: 25 },     // schemas.py
-            ];
-            offsetX = apiOffsets[idx]?.x ?? 0;
-            offsetY = apiOffsets[idx]?.y ?? 0;
-          } else if (cluster.path === 'utils') {
-            // 2 files: helpers.py top, constants.py bottom
-            const utilOffsets = [
-              { x: -5, y: -25 },   // helpers.py
-              { x: 30, y: 25 },    // constants.py
-            ];
-            offsetX = utilOffsets[idx]?.x ?? 0;
-            offsetY = utilOffsets[idx]?.y ?? 0;
-          } else {
-            // Generic dynamic grid for any backend repo
-            const col = idx % 2;
-            const row = Math.floor(idx / 2);
-            offsetX = col === 0 ? -65 : 65;
-            offsetY = row * 50 - 25;
-          }
-
-          child.position({
-            x: basePos.x + offsetX,
-            y: basePos.y + offsetY,
-          });
-        });
-      });
-
-      // Fit to screen smoothly
-      cy.fit(undefined, 70);
+  // Throttled update to maintain 60fps on continuous pan/zoom/drag
+  const updateClusterBoxesThrottled = useCallback(() => {
+    if (animFrameRef.current) return;
+    animFrameRef.current = requestAnimationFrame(() => {
+      animFrameRef.current = null;
       updateClusterBoxes();
-    } else if (layoutType === 'hierarchical') {
-      // ─── UNCLUSTERED ACCORDION / HIERARCHICAL PIPELINE LAYOUT ────────────────
-      // Groups clusters into clean architectural tiers from top to bottom
-      // Spreads clusters with ample room (vertical gap 380px, horizontal gap 420px)
-      // Allows user to scroll and pan easily without any visual clutter or overlaps
-      const clusters = graphData?.clusters || [];
-      const edges = graphData?.edges || [];
+    });
+  }, [updateClusterBoxes]);
 
-      // Derive inter-cluster dependencies to compute topological level
-      const clusterInDegree = {};
-      const clusterOut = {};
-      clusters.forEach((c) => {
-        clusterInDegree[c.path] = 0;
-        clusterOut[c.path] = new Set();
-      });
+  // Apply Cytoscape Layout (Spacious Force-Directed or Topological Hierarchical)
+  const applyLayout = useCallback(
+    (layoutType = activeLayout) => {
+      const cy = cyRef.current;
+      if (!cy || cy.nodes().length === 0) return;
 
-      edges.forEach((e) => {
-        const sNode = graphData.nodes?.find((n) => n.id === e.source);
-        const tNode = graphData.nodes?.find((n) => n.id === e.target);
-        if (sNode && tNode && sNode.cluster !== tNode.cluster) {
-          if (clusterOut[sNode.cluster]) {
-            clusterOut[sNode.cluster].add(tNode.cluster);
-          }
-        }
-      });
-
-      Object.keys(clusterOut).forEach((sc) => {
-        clusterOut[sc].forEach((tc) => {
-          if (clusterInDegree[tc] !== undefined) {
-            clusterInDegree[tc] = (clusterInDegree[tc] || 0) + 1;
-          }
-        });
-      });
-
-      // Compute topological tier level for each cluster (0 = root / entrypoint, 1 = domain core, 2 = services, etc.)
-      const clusterLevels = {};
-      const roots = Object.keys(clusterInDegree).filter((c) => clusterInDegree[c] === 0);
-      roots.forEach((c) => { clusterLevels[c] = 0; });
-
-      const queue = [...roots];
-      const remainingIn = { ...clusterInDegree };
-      while (queue.length > 0) {
-        const curr = queue.shift();
-        const currLvl = clusterLevels[curr] || 0;
-        if (clusterOut[curr]) {
-          clusterOut[curr].forEach((neighbor) => {
-            clusterLevels[neighbor] = Math.max(clusterLevels[neighbor] || 0, currLvl + 1);
-            if (remainingIn[neighbor] !== undefined) {
-              remainingIn[neighbor]--;
-              if (remainingIn[neighbor] <= 0) {
-                queue.push(neighbor);
-              }
-            }
-          });
-        }
+      if (layoutType === 'force') {
+        computeForceDirectedLayout(cy, graphData);
+      } else if (layoutType === 'hierarchical') {
+        computeHierarchicalLayout(cy, graphData);
       }
 
-      // Default any disconnected/cycle clusters
-      clusters.forEach((c) => {
-        if (clusterLevels[c.path] === undefined) {
-          clusterLevels[c.path] = 1;
-        }
-      });
-
-      // Group clusters by tier
-      const tiers = {};
-      clusters.forEach((c) => {
-        const lvl = clusterLevels[c.path] || 0;
-        if (!tiers[lvl]) tiers[lvl] = [];
-        tiers[lvl].push(c);
-      });
-
-      // Position each tier with spacious, unclustered vertical and horizontal separation
-      const TIER_HEIGHT = 380;
-      const CLUSTER_WIDTH = 420;
-      const tierKeys = Object.keys(tiers).map(Number).sort((a, b) => a - b);
-
-      tierKeys.forEach((lvl) => {
-        const clustersInTier = tiers[lvl];
-        const tierY = (lvl - (tierKeys.length - 1) / 2) * TIER_HEIGHT;
-        const totalW = (clustersInTier.length - 1) * CLUSTER_WIDTH;
-
-        clustersInTier.forEach((cluster, colIdx) => {
-          const clusterX = colIdx * CLUSTER_WIDTH - totalW / 2;
-          const childNodes = cy.nodes(`[cluster = "${cluster.path}"]`);
-
-          // Position files inside cluster box with generous breathing room
-          childNodes.forEach((child, idx) => {
-            const col = idx % 2;
-            const row = Math.floor(idx / 2);
-            const offsetX = col === 0 ? -70 : 70;
-            const offsetY = row * 52 - 30;
-
-            child.position({
-              x: clusterX + offsetX,
-              y: tierY + offsetY,
-            });
-          });
-        });
-      });
-
-      // Zoom and center cleanly so user can scroll/pan naturally through tiers
       cy.animate({
-        fit: { eles: cy.elements(), padding: 80 },
-        duration: 400,
+        fit: { eles: cy.elements(), padding: 75 },
+        duration: 350,
       });
-      setTimeout(updateClusterBoxes, 50);
-    }
-  }, [activeLayout, graphData, updateClusterBoxes]);
+
+      // Synchronize visual cluster boxes immediately and after animation finishes
+      updateClusterBoxes();
+      setTimeout(updateClusterBoxes, 360);
+    },
+    [activeLayout, graphData, updateClusterBoxes]
+  );
 
   // Initialize Cytoscape Instance
   useEffect(() => {
@@ -386,69 +301,77 @@ export default function CytoscapeGalaxyGraph({
       minZoom: 0.2,
       maxZoom: 3.5,
       style: [
-        // ─── FILE NODES (Pills matching reference image) ─────────────────────
+        // ─── CODE NODES (Dynamically dimensioned per label & type) ───────────
         {
           selector: 'node',
           style: {
             'shape': 'round-rectangle',
-            'width': 134,
-            'height': 34,
-            'corner-radius': 10,
-            'background-color': '#080e1e',
+            'width': 'data(width)',
+            'height': 'data(height)',
+            'corner-radius': 'data(cornerRadius)',
+            'background-color': 'data(bgColor)',
             'background-opacity': 0.95,
             'border-width': 1.6,
-            'border-color': '#38bdf8', // glowing cyan default
+            'border-color': 'data(borderColor)',
             'border-opacity': 0.85,
             'label': 'data(label)',
             'color': '#f8fafc',
             'text-valign': 'center',
             'text-halign': 'center',
-            'font-family': "'JetBrains Mono', 'Plus Jakarta Sans', monospace",
-            'font-size': '11.5px',
+            'font-family': 'JetBrains Mono, Plus Jakarta Sans, monospace',
+            'font-size': 'data(fontSize)',
             'font-weight': 600,
-            'background-image': PYTHON_SVG,
+            'background-image': 'data(icon)',
             'background-fit': 'contain',
-            'background-width': '16px',
-            'background-height': '16px',
-            'background-position-x': '12px',
+            'background-width': '15px',
+            'background-height': '15px',
+            'background-position-x': '11px',
             'background-position-y': '50%',
-            'text-margin-x': '10px',
+            'text-margin-x': '9px',
+            'text-max-width': 'data(textMaxWidth)',
+            'text-wrap': 'ellipsis',
             'text-outline-color': '#080e1e',
             'text-outline-width': 1.5,
-            'cursor': 'pointer',
             'transition-property': 'border-color, border-width, opacity, underlay-opacity',
-            'transition-duration': '0.2s',
+            'transition-duration': '0.18s',
             'z-index': 10,
           },
         },
-        // ─── FILE-TO-FILE DIRECTED EDGES ─────────────────────────────────────
+
+        // ─── BASE DIRECTED EDGES (Smooth, restrained bezier curves) ─────────
         {
           selector: 'edge',
           style: {
-            'width': 1.7,
+            'width': 1.5,
             'curve-style': 'bezier',
+            'control-point-step-size': 32, // Distinguishes parallel and reverse edges with dedicated curvature
             'target-arrow-shape': 'triangle',
-            'arrow-scale': 1.15,
-            'line-opacity': 0.65,
+            'arrow-scale': 0.82, // Clean, restrained arrowheads
+            'line-opacity': 0.45,
             'target-arrow-fill': 'filled',
             'transition-property': 'line-color, width, line-opacity, z-index',
-            'transition-duration': '0.2s',
+            'transition-duration': '0.18s',
             'z-index': 5,
           },
         },
-        // Edge color variations based on exact relation matching reference legend
+
+        // Relationship-specific styling matching codebase conventions
         {
           selector: 'edge[relation = "imports"]',
           style: {
             'line-color': '#f97316', // Orange
             'target-arrow-color': '#f97316',
+            'line-style': 'solid',
+            'line-opacity': 0.50,
           },
         },
         {
           selector: 'edge[relation = "calls"]',
           style: {
-            'line-color': '#38bdf8', // Blue/Cyan
+            'line-color': '#38bdf8', // Cyan / Light Blue
             'target-arrow-color': '#38bdf8',
+            'line-style': 'solid',
+            'line-opacity': 0.50,
           },
         },
         {
@@ -456,21 +379,27 @@ export default function CytoscapeGalaxyGraph({
           style: {
             'line-color': '#a855f7', // Purple
             'target-arrow-color': '#a855f7',
+            'line-style': 'dashed',
+            'line-dash-pattern': [5, 4],
+            'line-opacity': 0.45,
           },
         },
         {
           selector: 'edge[relation = "contains"]',
           style: {
-            'line-color': '#10b981', // Green
+            'line-color': '#10b981', // Emerald Green
             'target-arrow-color': '#10b981',
+            'line-style': 'dotted',
+            'line-dash-pattern': [2, 3],
+            'line-opacity': 0.38,
           },
         },
 
-        // ─── SELECTION & FOCUS HIGHLIGHTING ──────────────────────────────────
+        // ─── SELECTION & HOVER HIGHLIGHTING ──────────────────────────────────
         {
           selector: 'node.selected',
           style: {
-            'border-color': '#f43f5e', // Neon pink/magenta border
+            'border-color': '#f43f5e', // Neon rose/pink border
             'border-width': 2.8,
             'border-opacity': 1.0,
             'background-color': '#1c102a',
@@ -482,6 +411,18 @@ export default function CytoscapeGalaxyGraph({
           },
         },
         {
+          selector: 'node.hovered',
+          style: {
+            'border-width': 2.4,
+            'border-opacity': 1.0,
+            'underlay-color': '#38bdf8',
+            'underlay-padding': 5,
+            'underlay-opacity': 0.35,
+            'underlay-shape': 'round-rectangle',
+            'z-index': 90,
+          },
+        },
+        {
           selector: 'node.connected-neighbor',
           style: {
             'border-width': 2.2,
@@ -490,20 +431,43 @@ export default function CytoscapeGalaxyGraph({
             'z-index': 80,
           },
         },
+        // Directional edge glows
         {
-          selector: 'edge.highlighted-edge',
+          selector: 'edge.edge-incoming',
           style: {
-            'width': 2.9,
+            'line-color': '#38bdf8', // Glowing cyan incoming
+            'target-arrow-color': '#38bdf8',
+            'width': 2.8,
             'line-opacity': 1.0,
-            'target-arrow-fill': 'filled',
+            'arrow-scale': 1.25,
+            'z-index': 95,
+          },
+        },
+        {
+          selector: 'edge.edge-outgoing',
+          style: {
+            'line-color': '#fb923c', // Glowing amber/orange outgoing
+            'target-arrow-color': '#fb923c',
+            'width': 2.8,
+            'line-opacity': 1.0,
+            'arrow-scale': 1.25,
+            'z-index': 95,
+          },
+        },
+        {
+          selector: 'edge.edge-hovered',
+          style: {
+            'width': 3.2,
+            'line-opacity': 1.0,
             'arrow-scale': 1.35,
-            'z-index': 90,
+            'z-index': 98,
           },
         },
         {
           selector: '.dimmed',
           style: {
-            'opacity': 0.2,
+            'opacity': 0.16,
+            'line-opacity': 0.12,
           },
         },
         {
@@ -516,16 +480,57 @@ export default function CytoscapeGalaxyGraph({
     });
 
     cyRef.current = cy;
+    if (typeof window !== 'undefined') {
+      window.__cy = cy;
+    }
 
-    // Synchronize cluster boxes on pan, zoom, render, or drag
+    // Synchronize cluster boxes on pan, zoom, render, or drag throttled to 60fps
     cy.on('render pan zoom position drag', () => {
-      updateClusterBoxes();
+      updateClusterBoxesThrottled();
     });
 
     // Node click handler
     cy.on('tap', 'node', (evt) => {
       const node = evt.target;
       onSelectNode?.(node.id());
+    });
+
+    // Node hover preview (independent of active persistent selection)
+    cy.on('mouseover', 'node', (evt) => {
+      const node = evt.target;
+      hoverTargetRef.current = { type: 'node', id: node.id() };
+      applyVisualState();
+      if (containerRef.current) containerRef.current.style.cursor = 'pointer';
+    });
+
+    cy.on('mouseout', 'node', () => {
+      hoverTargetRef.current = null;
+      applyVisualState();
+      if (containerRef.current) containerRef.current.style.cursor = 'default';
+    });
+
+    // Edge hover inspection tooltip & highlight preview
+    cy.on('mouseover', 'edge', (evt) => {
+      const edge = evt.target;
+      const sNode = edge.source();
+      const tNode = edge.target();
+      setHoveredEdge({
+        id: edge.id(),
+        source: sNode.data('label') || sNode.id(),
+        target: tNode.data('label') || tNode.id(),
+        relation: edge.data('relation') || 'imports',
+        isCross: edge.data('is_cross_cluster'),
+      });
+      hoverTargetRef.current = { type: 'edge', id: edge.id() };
+      applyVisualState();
+      if (containerRef.current) containerRef.current.style.cursor = 'pointer';
+    });
+
+    cy.on('mouseout', 'edge', () => {
+      setHoveredEdge(null);
+      hoverTargetRef.current = null;
+      applyVisualState();
+      if (containerRef.current) containerRef.current.style.cursor = 'default';
     });
 
     // Background click (deselect)
@@ -539,7 +544,20 @@ export default function CytoscapeGalaxyGraph({
       cy.destroy();
       cyRef.current = null;
     };
-  }, []);
+  }, [onSelectNode, updateClusterBoxesThrottled]);
+
+  // Keep Cytoscape canvas sized correctly when sidebar/panel expands or window resizes
+  useEffect(() => {
+    if (!containerRef.current) return;
+    const ro = new ResizeObserver(() => {
+      if (cyRef.current) {
+        cyRef.current.resize();
+        updateClusterBoxesThrottled();
+      }
+    });
+    ro.observe(containerRef.current);
+    return () => ro.disconnect();
+  }, [updateClusterBoxesThrottled]);
 
   // Update elements on change
   useEffect(() => {
@@ -553,33 +571,8 @@ export default function CytoscapeGalaxyGraph({
 
   // Synchronize selection state with Cytoscape styling
   useEffect(() => {
-    const cy = cyRef.current;
-    if (!cy) return;
-
-    // Reset previous classes
-    cy.elements().removeClass('selected connected-neighbor highlighted-edge dimmed');
-
-    if (!selectedNodeId) {
-      return;
-    }
-
-    const selectedNode = cy.getElementById(selectedNodeId);
-    if (!selectedNode || selectedNode.length === 0) return;
-
-    // Dim all elements first
-    cy.elements().addClass('dimmed');
-
-    // Highlight selected node
-    selectedNode.removeClass('dimmed').addClass('selected');
-
-    // Find incoming and outgoing edges
-    const connectedEdges = selectedNode.connectedEdges();
-    connectedEdges.removeClass('dimmed').addClass('highlighted-edge');
-
-    // Find directly connected neighbor nodes
-    const connectedNodes = connectedEdges.connectedNodes();
-    connectedNodes.removeClass('dimmed').addClass('connected-neighbor');
-  }, [selectedNodeId]);
+    applyVisualState();
+  }, [selectedNodeId, applyVisualState]);
 
   // Center on selected node when triggered
   const handleCenterOnSelected = () => {
@@ -940,7 +933,74 @@ export default function CytoscapeGalaxyGraph({
           ))}
         </div>
 
-        {/* Cytoscape DOM container (File nodes + File-to-file arrows) */}
+        {/* Floating Edge Info Tooltip */}
+        {hoveredEdge && (
+          <div
+            style={{
+              position: 'absolute',
+              top: '16px',
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 40,
+              display: 'flex',
+              alignItems: 'center',
+              gap: '8px',
+              padding: '6px 14px',
+              borderRadius: '20px',
+              border: '1px solid rgba(255, 255, 255, 0.15)',
+              background: 'rgba(10, 16, 30, 0.94)',
+              backdropFilter: 'blur(12px)',
+              boxShadow: '0 8px 24px rgba(0, 0, 0, 0.5)',
+              fontSize: '12px',
+              fontFamily: 'var(--font-mono, monospace)',
+              color: '#e2e8f0',
+              pointerEvents: 'none',
+            }}
+          >
+            <span style={{ color: '#38bdf8', fontWeight: 600 }}>{hoveredEdge.source}</span>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#94a3b8' }}>
+              <ArrowRight size={12} />
+              <span
+                style={{
+                  fontSize: '10.5px',
+                  textTransform: 'uppercase',
+                  letterSpacing: '0.05em',
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  backgroundColor: 'rgba(255, 255, 255, 0.08)',
+                  color:
+                    hoveredEdge.relation === 'imports'
+                      ? '#f97316'
+                      : hoveredEdge.relation === 'calls'
+                      ? '#38bdf8'
+                      : hoveredEdge.relation === 'defines'
+                      ? '#a855f7'
+                      : '#10b981',
+                }}
+              >
+                {hoveredEdge.relation}
+              </span>
+              <ArrowRight size={12} />
+            </div>
+            <span style={{ color: '#fb923c', fontWeight: 600 }}>{hoveredEdge.target}</span>
+            {hoveredEdge.isCross && (
+              <span
+                style={{
+                  fontSize: '9.5px',
+                  padding: '1px 5px',
+                  borderRadius: '3px',
+                  backgroundColor: 'rgba(244, 63, 94, 0.2)',
+                  color: '#fda4af',
+                  border: '1px solid rgba(244, 63, 94, 0.4)',
+                }}
+              >
+                cross-cluster
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Cytoscape DOM container (File & Symbol nodes + Directed arrows) */}
         <div
           ref={containerRef}
           style={{
@@ -1056,45 +1116,67 @@ export default function CytoscapeGalaxyGraph({
             right: '24px',
             zIndex: 25,
             display: 'flex',
+            flexWrap: 'wrap',
             alignItems: 'center',
-            gap: '14px',
+            gap: '12px',
+            maxWidth: 'calc(100% - 320px)',
             padding: '8px 16px',
             borderRadius: '12px',
             border: '1px solid rgba(255, 255, 255, 0.12)',
-            background: 'rgba(10, 16, 30, 0.88)',
+            background: 'rgba(10, 16, 30, 0.90)',
             backdropFilter: 'blur(12px)',
             fontSize: '11px',
             fontFamily: 'var(--font-mono, monospace)',
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '12px', height: '12px', borderRadius: '3px', backgroundColor: 'rgba(244, 63, 94, 0.2)', border: '1px solid #f43f5e', display: 'inline-block' }} />
-            <span style={{ color: '#d1d5db' }}>Folder (Cluster)</span>
+          {/* Node Types */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '10px', height: '10px', borderRadius: '2px', backgroundColor: 'rgba(244, 63, 94, 0.2)', border: '1px solid #f43f5e', display: 'inline-block' }} />
+            <span style={{ color: '#d1d5db' }}>Folder</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '16px', height: '8px', borderRadius: '3px', backgroundColor: '#080e1e', border: '1px solid #38bdf8', display: 'inline-block' }} />
-            <span style={{ color: '#d1d5db' }}>File Node</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '14px', height: '8px', borderRadius: '2px', backgroundColor: '#080e1e', border: '1.2px solid #38bdf8', display: 'inline-block' }} />
+            <span style={{ color: '#d1d5db' }}>File</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '16px', height: '8px', borderRadius: '3px', backgroundColor: '#1c102a', border: '1px solid #f43f5e', boxShadow: '0 0 6px #f43f5e', display: 'inline-block' }} />
-            <span style={{ color: '#fda4af' }}>Selected Node</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '14px', height: '8px', borderRadius: '2px', backgroundColor: '#0c0e24', border: '1.2px solid #a855f7', display: 'inline-block' }} />
+            <span style={{ color: '#d1d5db' }}>Class</span>
           </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '14px', height: '8px', borderRadius: '2px', backgroundColor: '#061a1a', border: '1.2px solid #10b981', display: 'inline-block' }} />
+            <span style={{ color: '#d1d5db' }}>Function</span>
+          </div>
+
           <div style={{ width: '1px', height: '14px', backgroundColor: 'rgba(255, 255, 255, 0.15)' }} />
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+
+          {/* Relationship Types */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
             <span style={{ width: '14px', height: '2px', backgroundColor: '#f97316', display: 'inline-block' }} />
-            <span style={{ color: '#f97316' }}>Dependency (imports)</span>
+            <span style={{ color: '#f97316' }}>Imports</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
             <span style={{ width: '14px', height: '2px', backgroundColor: '#38bdf8', display: 'inline-block' }} />
-            <span style={{ color: '#38bdf8' }}>Function Call</span>
+            <span style={{ color: '#38bdf8' }}>Calls</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '14px', height: '2px', backgroundColor: '#a855f7', display: 'inline-block' }} />
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '14px', height: '0px', borderTop: '2px dashed #a855f7', display: 'inline-block' }} />
             <span style={{ color: '#a855f7' }}>Defines</span>
           </div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <span style={{ width: '14px', height: '2px', backgroundColor: '#10b981', display: 'inline-block' }} />
-            <span style={{ color: '#10b981' }}>Contains / Uses</span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '14px', height: '0px', borderTop: '2px dotted #10b981', display: 'inline-block' }} />
+            <span style={{ color: '#10b981' }}>Contains</span>
+          </div>
+
+          <div style={{ width: '1px', height: '14px', backgroundColor: 'rgba(255, 255, 255, 0.15)' }} />
+
+          {/* Focus Direction Hint */}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#fb923c', boxShadow: '0 0 6px #fb923c', display: 'inline-block' }} />
+            <span style={{ color: '#fdba74' }}>Outgoing</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '5px' }}>
+            <span style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#38bdf8', boxShadow: '0 0 6px #38bdf8', display: 'inline-block' }} />
+            <span style={{ color: '#7dd3fc' }}>Incoming</span>
           </div>
         </div>
       </div>
